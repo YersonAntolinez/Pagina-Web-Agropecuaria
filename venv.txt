@@ -1,1 +1,3 @@
-.\venv\Scripts\activate
+.\venv\Scripts\activate para inicar el entorno virtual
+
+python src/ui/inventario.py  para invocar el inventario
