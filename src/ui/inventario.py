@@ -207,7 +207,10 @@ def encabezado_tabla(ubicaciones, es_admin=False):
         ),
     )
 
-def tarjeta_resumen(icono, label, valor, color=TEXTO):
+def tarjeta_resumen(icono, label, valor, color=TEXTO, on_click=None, seleccionada=False):
+    borde_color  = color if seleccionada else BORDE
+    borde_grosor = 2     if seleccionada else 1
+    bg           = "#1a2433" if seleccionada else FONDO_CARD
     return ft.Container(
         content=ft.Column([
             ft.Row([
@@ -215,12 +218,19 @@ def tarjeta_resumen(icono, label, valor, color=TEXTO):
                 ft.Text(label, size=12, color=TEXTO_GRIS),
             ], spacing=8),
             ft.Text(str(valor), size=22, color=color, weight=ft.FontWeight.BOLD),
-        ], spacing=6),
-        bgcolor=FONDO_CARD,
-        border=ft.border.all(1, BORDE),
+            ft.Text(
+                "Clic para filtrar" if on_click and not seleccionada else ("Clic para quitar filtro" if seleccionada else ""),
+                size=10, color=TEXTO_GRIS, italic=True,
+            ),
+        ], spacing=4),
+        bgcolor=bg,
+        border=ft.border.all(borde_grosor, borde_color),
         border_radius=10,
         padding=ft.padding.symmetric(horizontal=20, vertical=14),
         expand=True,
+        on_click=on_click,
+        ink=True if on_click else False,
+        tooltip="Filtrar por esta alerta" if on_click and not seleccionada else ("Quitar filtro" if seleccionada else None),
     )
 
 
@@ -235,7 +245,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
     tipos       = obtener_tipos(db)
 
     # Estado mutable
-    estado = {"tipo": None, "texto": None}
+    estado = {"tipo": None, "texto": None, "alerta": None}
 
     # Contenedores reactivos
     resumen_row  = ft.Row(spacing=12)
@@ -263,19 +273,36 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         criticos = sum(1 for p in prods if any(
             float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
         ))
-        sin_stk  = sum(1 for p in prods if all(
+        sin_stk  = sum(1 for p in prods if any(
             float(v) <= 0 for v in p['stocks'].values()
         ))
         return total, criticos, sin_stk
 
-    def reconstruir_resumen(prods):
-        total, criticos, sin_stk = calcular_resumen(prods)
+    def reconstruir_resumen(prods_todos):
+        # Siempre calcular sobre TODOS los productos (sin filtro de alerta)
+        # para que los contadores no cambien al filtrar
+        filas_todos = obtener_stock(db, estado["tipo"], estado["texto"], es_admin)
+        base = agrupar_por_producto(filas_todos, es_admin)
+        total, criticos, sin_stk = calcular_resumen(base)
+
+        def click_critico(e):
+            estado["alerta"] = None if estado["alerta"] == "critico" else "critico"
+            aplicar_filtro_alerta()
+
+        def click_sin_stock(e):
+            estado["alerta"] = None if estado["alerta"] == "sin_stock" else "sin_stock"
+            aplicar_filtro_alerta()
+
         resumen_row.controls = [
             tarjeta_resumen("inventory_2",     "Total Productos", total),
             tarjeta_resumen("warning_rounded", "Stock Crítico",   criticos,
-                            AMARILLO if criticos else TEXTO),
+                            AMARILLO if criticos else TEXTO,
+                            on_click=click_critico if criticos else None,
+                            seleccionada=(estado["alerta"] == "critico")),
             tarjeta_resumen("error_rounded",   "Sin Stock",       sin_stk,
-                            ROJO if sin_stk else TEXTO),
+                            ROJO if sin_stk else TEXTO,
+                            on_click=click_sin_stock if sin_stk else None,
+                            seleccionada=(estado["alerta"] == "sin_stock")),
             tarjeta_resumen("store",           "Ubicaciones",     len(ubicaciones)),
         ]
 
@@ -295,6 +322,24 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         else:
             for i, prod in enumerate(prods):
                 cuerpo_tabla.controls.append(fila_producto(prod, ubicaciones, i, es_admin))
+
+    def aplicar_filtro_alerta():
+        """Filtra la tabla según la alerta seleccionada en las tarjetas."""
+        filas = obtener_stock(db, estado["tipo"], estado["texto"], es_admin)
+        prods = agrupar_por_producto(filas, es_admin)
+
+        if estado["alerta"] == "critico":
+            prods = [p for p in prods if any(
+                float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
+            )]
+        elif estado["alerta"] == "sin_stock":
+            prods = [p for p in prods if any(
+                float(v) <= 0 for v in p['stocks'].values()
+            )]
+
+        reconstruir_resumen(prods)
+        reconstruir_tabla(prods)
+        page.update()
 
     def reconstruir_filtros():
         """Redibuja los botones de filtro reflejando el estado activo."""
@@ -363,8 +408,9 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         reconstruir_tabla(prods)
         page.update()
 
-    async def on_refrescar(e):
+    def on_refrescar(e):
         btn_refrescar.disabled = True
+        btn_refrescar.icon_color = TEXTO_GRIS
         page.update()
         estado["tipo"]  = None
         estado["texto"] = None
@@ -375,7 +421,8 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         reconstruir_resumen(prods)
         reconstruir_tabla(prods)
         btn_refrescar.disabled = False
-        await page.update_async()
+        btn_refrescar.icon_color = VERDE_CLARO
+        page.update()
 
     # ── Componentes ──
 
