@@ -1,9 +1,10 @@
 """
-inventario.py — Módulo de Inventario v2
+inventario.py — Módulo de Inventario v3
 =========================================
+- Sin tabla producto_presentacion
 - Vista de tabla con filtros y alertas
-- Modal: Agregar producto con presentaciones y stock inicial
-- Modal: Editar producto existente
+- Modal: Agregar producto con stock inicial por ubicación
+- Modal: Editar producto
 - Modal: Registrar entrada de mercancía
 - Desactivar producto (sin borrar historial)
 
@@ -51,6 +52,11 @@ def obtener_tipos(db):
         "SELECT idTipoProducto, nombre FROM tipo_producto ORDER BY nombre"
     )
 
+def obtener_unidades(db):
+    return db.fetch_query(
+        "SELECT nombre FROM unidad_medida ORDER BY nombre"
+    )
+
 def obtener_stock(db, filtro_tipo=None, filtro_texto=None, es_admin=False):
     campos_extra = ", p.precio_compra" if es_admin else ""
     query = f"""
@@ -83,19 +89,13 @@ def obtener_stock(db, filtro_tipo=None, filtro_texto=None, es_admin=False):
     query += " ORDER BY tp.nombre, p.nombre, u.tipo DESC"
     return db.fetch_query(query, params or None)
 
-def obtener_producto_completo(db, id_producto):
-    """Trae todos los datos de un producto incluyendo sus presentaciones."""
-    prod = db.fetch_one("""
+def obtener_producto(db, id_producto):
+    return db.fetch_one("""
         SELECT p.*, tp.nombre AS tipo_nombre
         FROM producto p
         JOIN tipo_producto tp ON tp.idTipoProducto = p.idTipoProducto
         WHERE p.idProducto = %s
     """, (id_producto,))
-    pres = db.fetch_query("""
-        SELECT * FROM producto_presentacion
-        WHERE idProducto = %s ORDER BY es_unidad_base DESC, nombre_presentacion
-    """, (id_producto,))
-    return prod, pres
 
 def agrupar_por_producto(filas, es_admin=False):
     productos = {}
@@ -122,20 +122,30 @@ def agrupar_por_producto(filas, es_admin=False):
 # HELPERS UI
 # ─────────────────────────────────────────────────────────────
 
-def campo(label, hint="", password=False, valor="", teclado=ft.KeyboardType.TEXT, expand=True):
-    return ft.TextField(
+def campo(label, hint="", valor="", teclado=ft.KeyboardType.TEXT, expand=True, ancho=None):
+    def on_focus(e):
+        # Al enfocar un campo numérico con valor 0, lo limpia para no tener que borrar
+        if teclado == ft.KeyboardType.NUMBER and e.control.value in ("0", "0.0"):
+            e.control.value = ""
+            e.control.update()
+
+    tf = ft.TextField(
         label=label, hint_text=hint, value=str(valor),
-        password=password, keyboard_type=teclado,
+        keyboard_type=teclado,
         border_radius=8, bgcolor="#1a1f25",
         border_color=BORDE, focused_border_color=VERDE,
-        text_size=13, cursor_color=VERDE,
-        label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
+        text_size=14, cursor_color=VERDE,
+        label_style=ft.TextStyle(color=TEXTO_GRIS, size=13),
+        on_focus=on_focus,
         expand=expand,
     )
+    if ancho:
+        tf.width = ancho
+    return tf
 
 def dropdown_tipos(tipos, valor_inicial=None):
     return ft.Dropdown(
-        label="Categoría",
+        label="Categoría *",
         border_radius=8, bgcolor="#1a1f25",
         border_color=BORDE, focused_border_color=VERDE,
         text_size=13,
@@ -145,20 +155,14 @@ def dropdown_tipos(tipos, valor_inicial=None):
         expand=True,
     )
 
-def dropdown_unidad(valor_inicial="Litro"):
+def dropdown_unidad(unidades, valor_inicial=None):
     return ft.Dropdown(
-        label="Unidad base",
+        label="Unidad de medida *",
         border_radius=8, bgcolor="#1a1f25",
         border_color=BORDE, focused_border_color=VERDE,
         text_size=13,
         label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
-        options=[
-            ft.dropdown.Option("Litro"),
-            ft.dropdown.Option("Galón"),
-            ft.dropdown.Option("Kilogramo"),
-            ft.dropdown.Option("Gramo"),
-            ft.dropdown.Option("Unidad"),
-        ],
+        options=[ft.dropdown.Option(u['nombre']) for u in unidades],
         value=valor_inicial,
         expand=True,
     )
@@ -280,162 +284,77 @@ def encabezado_tabla(ubicaciones, es_admin=False):
         ),
     )
 
+def fila_producto(producto, ubicaciones, indice, es_admin, on_editar, on_desactivar):
+    bg = FONDO_FILA if indice % 2 == 0 else FONDO_FILA_ALT
+    stock_total = sum(float(v) for v in producto['stocks'].values())
+
+    celdas = [
+        celda(ft.Text(producto['nombre'], size=13, color=TEXTO,
+                      weight=ft.FontWeight.W_500), ancho=200),
+        celda(badge_tipo(producto['tipo']), ancho=120),
+    ]
+    for ub in ubicaciones:
+        stock = producto['stocks'].get(ub['idUbicacion'], 0)
+        celdas.append(celda(indicador_stock(stock, producto['stock_minimo']), ancho=140))
+
+    celdas += [
+        celda(ft.Text(f"{stock_total:,.1f}", size=13, color=TEXTO_GRIS), ancho=100),
+        celda(ft.Text(producto['unidad'],     size=13, color=TEXTO_GRIS), ancho=90),
+        celda(ft.Text(f"${float(producto['precio_lista']):,.0f}",
+                      size=13, color=VERDE_CLARO), ancho=110),
+    ]
+    if es_admin:
+        pc = float(producto.get('precio_compra') or 0)
+        celdas.append(celda(ft.Text(f"${pc:,.0f}", size=13, color="#ef9a9a"), ancho=120))
+
+    celdas.append(celda(
+        ft.Row([
+            ft.IconButton(
+                icon="edit_rounded", icon_color=AMARILLO,
+                icon_size=18, tooltip="Editar producto",
+                on_click=lambda e, pid=producto['id']: on_editar(pid),
+            ),
+            ft.IconButton(
+                icon="visibility_off_rounded", icon_color=ROJO,
+                icon_size=18, tooltip="Desactivar producto",
+                on_click=lambda e, pid=producto['id'], pnom=producto['nombre']:
+                    on_desactivar(pid, pnom),
+            ),
+        ], spacing=0),
+        ancho=100
+    ))
+
+    return ft.Container(
+        content=ft.Row(celdas, spacing=0),
+        bgcolor=bg,
+        border=ft.border.only(bottom=ft.border.BorderSide(1, BORDE)),
+        on_hover=lambda e: _hover(e, bg),
+    )
+
 
 # ─────────────────────────────────────────────────────────────
 # MODALES
 # ─────────────────────────────────────────────────────────────
 
-def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
-    """Modal para crear un producto nuevo con presentaciones y stock inicial."""
+def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_guardado):
+    f_nombre    = campo("Nombre del producto *", "Ej: Roundup 480")
+    f_precio_v  = campo("Precio de venta *", teclado=ft.KeyboardType.NUMBER, valor="0")
+    f_precio_c  = campo("Precio de compra", teclado=ft.KeyboardType.NUMBER, valor="0") if es_admin else None
+    f_stock_min = campo("Stock mínimo *", teclado=ft.KeyboardType.NUMBER, valor="5", expand=False, ancho=160)
+    dd_tipo     = dropdown_tipos(tipos)
+    dd_unidad   = dropdown_unidad(unidades)
+    msg_global  = ft.Text("", size=13, color=ROJO)
 
-    presentaciones_state = []  # lista de dicts con los datos de cada presentación
-
-    # ── Campos principales ──
-    f_nombre     = campo("Nombre del producto *", "Ej: Roundup 480")
-    f_precio_v   = campo("Precio venta *", "0", teclado=ft.KeyboardType.NUMBER)
-    f_precio_c   = campo("Precio compra", "0", teclado=ft.KeyboardType.NUMBER) if es_admin else None
-    f_stock_min  = campo("Stock mínimo *", "5", teclado=ft.KeyboardType.NUMBER)
-    dd_tipo      = dropdown_tipos(tipos)
-    dd_unidad    = dropdown_unidad()
-
-    # ── Sección presentaciones ──
-    lista_pres   = ft.Column(spacing=6)
-    msg_pres     = ft.Text("", size=12, color=ROJO)
-
-    f_pres_nombre    = campo("Nombre de la presentación *", "Ej: Galón, Costal, Caja x12", expand=True)
-    f_pres_precio    = campo("Precio de venta *", "0", teclado=ft.KeyboardType.NUMBER, expand=False)
-    f_pres_precio.width = 150
-    cb_base = ft.Checkbox(label="Esta presentación ES la unidad base", value=False,
-                          active_color=VERDE, check_color="white")
-
-    # Campo de cantidad: su label cambia según la unidad base seleccionada
-    f_pres_cantidad  = campo("¿Cuántas unidades base contiene? *", "1",
-                             teclado=ft.KeyboardType.NUMBER, expand=False)
-    f_pres_cantidad.width = 230
-
-    # Texto de ayuda dinámico
-    hint_equivalencia = ft.Text("", size=12, color=TEXTO_GRIS, italic=True)
-    # Contenedor del campo cantidad (se oculta si es unidad base)
-    contenedor_cantidad = ft.Column([f_pres_cantidad], spacing=4, visible=True)
-
-    def actualizar_hint(e=None):
-        nombre   = f_pres_nombre.value.strip() or "esta presentación"
-        unidad   = dd_unidad.value or "unidad base"
-        cantidad = f_pres_cantidad.value.strip()
-        # Actualizar label del campo cantidad
-        f_pres_cantidad.label = f"¿Cuántos {unidad}s tiene 1 {nombre}? *"
-        try:
-            cant_f = float(cantidad)
-            hint_equivalencia.value = f'Equivale a {cant_f:g} {unidad}{"s" if cant_f != 1 else ""} en inventario'
-        except ValueError:
-            hint_equivalencia.value = ""
-        page.update()
-
-    def on_cb_base(e):
-        # Si marca como unidad base, ocultar campo cantidad (factor = 1 automático)
-        es_base = cb_base.value
-        contenedor_cantidad.visible = not es_base
-        if es_base:
-            f_pres_cantidad.value = "1"
-            hint_equivalencia.value = ""
-        page.update()
-
-    cb_base.on_change         = on_cb_base
-    f_pres_nombre.on_change   = actualizar_hint
-    f_pres_cantidad.on_change = actualizar_hint
-    dd_unidad.on_change       = actualizar_hint
-
-    def agregar_presentacion(e):
-        nombre   = f_pres_nombre.value.strip()
-        cantidad = f_pres_cantidad.value.strip()
-        precio   = f_pres_precio.value.strip()
-
-        if not nombre or not cantidad:
-            msg_pres.value = "Nombre y cantidad son obligatorios"
-            page.update()
-            return
-
-        try:
-            factor_f = float(cantidad)
-            precio_f = float(precio) if precio else 0
-        except ValueError:
-            msg_pres.value = "La cantidad y el precio deben ser números"
-            page.update()
-            return
-
-        if factor_f <= 0:
-            msg_pres.value = "La cantidad debe ser mayor a 0"
-            page.update()
-            return
-
-        if cb_base.value:
-            for p in presentaciones_state:
-                p['es_base'] = False
-
-        pres = {
-            'nombre':  nombre,
-            'factor':  factor_f,
-            'precio':  precio_f,
-            'es_base': cb_base.value,
-        }
-        presentaciones_state.append(pres)
-        f_pres_nombre.value   = ""
-        f_pres_cantidad.value = "1"
-        f_pres_precio.value   = "0"
-        cb_base.value         = False
-        msg_pres.value        = ""
-        hint_equivalencia.value = ""
-        reconstruir_lista_pres()
-        page.update()
-
-    def eliminar_pres(idx):
-        presentaciones_state.pop(idx)
-        reconstruir_lista_pres()
-        page.update()
-
-    def reconstruir_lista_pres():
-        lista_pres.controls.clear()
-        for i, p in enumerate(presentaciones_state):
-            base_badge = ft.Container(
-                content=ft.Text("BASE", size=10, color=VERDE_CLARO, weight=ft.FontWeight.W_600),
-                bgcolor="#0d2b0d", border_radius=4,
-                padding=ft.padding.symmetric(horizontal=6, vertical=2),
-                visible=p['es_base'],
-            )
-            lista_pres.controls.append(
-                ft.Container(
-                    content=ft.Row([
-                        ft.Text(p['nombre'], size=13, color=TEXTO, expand=True),
-                        ft.Text(f"×{p['factor']}", size=12, color=TEXTO_GRIS, width=60),
-                        ft.Text(f"${p['precio']:,.0f}", size=12, color=VERDE_CLARO, width=90),
-                        base_badge,
-                        ft.IconButton(
-                            icon="delete_outline_rounded", icon_color=ROJO,
-                            icon_size=18, tooltip="Eliminar",
-                            on_click=lambda e, idx=i: eliminar_pres(idx),
-                        ),
-                    ], spacing=8),
-                    bgcolor="#1a1f25",
-                    border=ft.border.all(1, BORDE),
-                    border_radius=8,
-                    padding=ft.padding.symmetric(horizontal=12, vertical=6),
-                )
-            )
-
-    # ── Sección stock inicial ──
+    # Stock inicial por ubicación
     stocks_fields = {}
-    stock_rows = ft.Column(spacing=6)
+    stock_rows = ft.Column(spacing=8)
     for ub in ubicaciones:
-        f = campo(ub['nombreUbicacion'], "0", teclado=ft.KeyboardType.NUMBER)
-        f.value = "0"
+        f = campo(f"Stock inicial — {ub['nombreUbicacion']}",
+                  "0", teclado=ft.KeyboardType.NUMBER, valor="0")
         stocks_fields[ub['idUbicacion']] = f
         stock_rows.controls.append(f)
 
-    # ── Mensaje de error/éxito ──
-    msg_global = ft.Text("", size=13, color=ROJO)
-
     def guardar(e):
-        # Validaciones
         nombre = f_nombre.value.strip()
         if not nombre:
             msg_global.value = "El nombre del producto es obligatorio"
@@ -446,7 +365,7 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
             page.update()
             return
         if not dd_unidad.value:
-            msg_global.value = "Selecciona la unidad base"
+            msg_global.value = "Selecciona la unidad de medida"
             page.update()
             return
         try:
@@ -457,20 +376,10 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
             msg_global.value = "Precios y stock mínimo deben ser números"
             page.update()
             return
-        if not presentaciones_state:
-            msg_global.value = "Agrega al menos una presentación"
-            page.update()
-            return
-        if not any(p['es_base'] for p in presentaciones_state):
-            msg_global.value = "Marca una presentación como unidad base"
-            page.update()
-            return
 
-        # Construir operaciones transaccionales
         id_producto = str(uuid.uuid4())
         ops = []
 
-        # Insertar producto
         if es_admin:
             ops.append((
                 """INSERT INTO producto
@@ -489,20 +398,11 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
                 (id_producto, nombre, dd_tipo.value, dd_unidad.value, precio_v, stk_min)
             ))
 
-        # Insertar presentaciones
-        for p in presentaciones_state:
-            ops.append((
-                """INSERT INTO producto_presentacion
-                   (idPresentacion, idProducto, nombre_presentacion,
-                    factor_conversion, es_unidad_base, precio_sugerido)
-                   VALUES (%s,%s,%s,%s,%s,%s)""",
-                (str(uuid.uuid4()), id_producto, p['nombre'],
-                 p['factor'], 1 if p['es_base'] else 0, p['precio'])
-            ))
-
-        # Insertar inventario inicial por ubicación
         for uid_ubic, f_stk in stocks_fields.items():
-            stk_val = float(f_stk.value or 0)
+            try:
+                stk_val = float(f_stk.value or 0)
+            except ValueError:
+                stk_val = 0
             ops.append((
                 """INSERT INTO inventario
                    (idInventario, idUbicacion, idProducto, stockActual)
@@ -512,53 +412,15 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
 
         result = db.run_transaction(ops)
         if result['success']:
-            msg_global.value = ""
             page.close(dlg)
             on_guardado()
         else:
-            msg_global.value = f"Error al guardar: {result['error']}"
+            msg_global.value = f"Error al guardar: {result.get('error', 'Error desconocido')}"
             page.update()
 
-    # ── Construcción del modal ──
-    campos_admin = [f_precio_c] if f_precio_c else []
-
-    contenido_modal = ft.Column([
-        seccion_titulo("Datos del Producto"),
-        f_nombre,
-        ft.Row([dd_tipo, dd_unidad], spacing=10),
-        ft.Row([f_precio_v] + campos_admin + [f_stock_min], spacing=10),
-
-        seccion_titulo("Presentaciones"),
-        ft.Container(
-            content=ft.Column([
-                ft.Row([f_pres_nombre, f_pres_precio], spacing=8),
-                ft.Row([
-                    cb_base,
-                    ft.Container(expand=True),
-                    ft.Container(
-                        content=ft.Text("+ Agregar", size=12, color="white",
-                                        weight=ft.FontWeight.W_600),
-                        bgcolor=VERDE, border_radius=8,
-                        padding=ft.padding.symmetric(horizontal=16, vertical=8),
-                        on_click=agregar_presentacion, ink=True,
-                    ),
-                ]),
-                contenedor_cantidad,
-                hint_equivalencia,
-                msg_pres,
-            ], spacing=8),
-            bgcolor="#12181f", border=ft.border.all(1, BORDE),
-            border_radius=8, padding=12,
-        ),
-        lista_pres,
-
-        seccion_titulo("Stock Inicial por Ubicación"),
-        stock_rows,
-
-        ft.Container(height=8),
-        msg_global,
-
-    ], scroll=ft.ScrollMode.AUTO, spacing=6, width=580)
+    campos_precio = [f_precio_v]
+    if f_precio_c:
+        campos_precio.append(f_precio_c)
 
     dlg = ft.AlertDialog(
         modal=True,
@@ -566,7 +428,26 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
             ft.Icon("add_box_rounded", color=VERDE, size=22),
             ft.Text("Agregar Producto", size=18, weight=ft.FontWeight.BOLD, color=TEXTO),
         ], spacing=10),
-        content=contenido_modal,
+        content=ft.Column([
+            seccion_titulo("Datos del Producto"),
+            f_nombre,
+            ft.Container(height=4),
+            ft.Row([dd_tipo, dd_unidad], spacing=12),
+            ft.Container(height=4),
+            ft.Row(campos_precio + [f_stock_min], spacing=12),
+
+            seccion_titulo("Stock Inicial por Ubicación"),
+            ft.Text(
+                "Ingresa el stock con el que arranca el producto en cada ubicación. "
+                "Puedes dejar en 0 si aún no hay existencias.",
+                size=13, color=TEXTO_GRIS,
+            ),
+            ft.Container(height=4),
+            stock_rows,
+
+            ft.Container(height=12),
+            msg_global,
+        ], scroll=ft.ScrollMode.AUTO, spacing=10, width=540),
         content_padding=ft.padding.symmetric(horizontal=20, vertical=16),
         bgcolor=FONDO_CARD,
         actions=[
@@ -585,42 +466,21 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, es_admin, on_guardado):
     return dlg
 
 
-def modal_editar_producto(page, db, id_producto, tipos, es_admin, on_guardado):
-    """Modal para editar un producto existente."""
-    prod, pres = obtener_producto_completo(db, id_producto)
+def modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin, on_guardado):
+    prod = obtener_producto(db, id_producto)
     if not prod:
         return None
 
     f_nombre    = campo("Nombre *", valor=prod['nombre'])
-    f_precio_v  = campo("Precio venta *", teclado=ft.KeyboardType.NUMBER, valor=prod['precio_lista'])
-    f_precio_c  = campo("Precio compra", teclado=ft.KeyboardType.NUMBER,
+    f_precio_v  = campo("Precio de venta *", teclado=ft.KeyboardType.NUMBER,
+                        valor=prod['precio_lista'])
+    f_precio_c  = campo("Precio de compra", teclado=ft.KeyboardType.NUMBER,
                         valor=prod.get('precio_compra', 0)) if es_admin else None
-    f_stock_min = campo("Stock mínimo *", teclado=ft.KeyboardType.NUMBER, valor=prod['stock_minimo'])
+    f_stock_min = campo("Stock mínimo *", teclado=ft.KeyboardType.NUMBER,
+                        valor=prod['stock_minimo'], expand=False, ancho=160)
     dd_tipo     = dropdown_tipos(tipos, valor_inicial=prod['idTipoProducto'])
-    dd_unidad   = dropdown_unidad(valor_inicial=prod['unidad_medida_base'])
-
+    dd_unidad   = dropdown_unidad(unidades, valor_inicial=prod['unidad_medida_base'])
     msg_global  = ft.Text("", size=13, color=ROJO)
-
-    # Lista de presentaciones (solo lectura en edición simple)
-    pres_lista = ft.Column([
-        ft.Container(
-            content=ft.Row([
-                ft.Text(p['nombre_presentacion'], size=13, color=TEXTO, expand=True),
-                ft.Text(f"×{float(p['factor_conversion'])}", size=12, color=TEXTO_GRIS, width=60),
-                ft.Text(f"${float(p['precio_sugerido']):,.0f}", size=12, color=VERDE_CLARO, width=90),
-                ft.Container(
-                    content=ft.Text("BASE", size=10, color=VERDE_CLARO, weight=ft.FontWeight.W_600),
-                    bgcolor="#0d2b0d", border_radius=4,
-                    padding=ft.padding.symmetric(horizontal=6, vertical=2),
-                    visible=bool(p['es_unidad_base']),
-                ),
-            ], spacing=8),
-            bgcolor="#1a1f25", border=ft.border.all(1, BORDE),
-            border_radius=8,
-            padding=ft.padding.symmetric(horizontal=12, vertical=6),
-        )
-        for p in pres
-    ], spacing=6)
 
     def guardar(e):
         nombre = f_nombre.value.strip()
@@ -657,7 +517,9 @@ def modal_editar_producto(page, db, id_producto, tipos, es_admin, on_guardado):
             msg_global.value = "Error al guardar cambios"
             page.update()
 
-    campos_admin = [f_precio_c] if f_precio_c else []
+    campos_precio = [f_precio_v]
+    if f_precio_c:
+        campos_precio.append(f_precio_c)
 
     dlg = ft.AlertDialog(
         modal=True,
@@ -668,13 +530,13 @@ def modal_editar_producto(page, db, id_producto, tipos, es_admin, on_guardado):
         content=ft.Column([
             seccion_titulo("Datos del Producto"),
             f_nombre,
-            ft.Row([dd_tipo, dd_unidad], spacing=10),
-            ft.Row([f_precio_v] + campos_admin + [f_stock_min], spacing=10),
-            seccion_titulo("Presentaciones actuales"),
-            pres_lista,
-            ft.Container(height=8),
+            ft.Container(height=4),
+            ft.Row([dd_tipo, dd_unidad], spacing=12),
+            ft.Container(height=4),
+            ft.Row(campos_precio + [f_stock_min], spacing=12),
+            ft.Container(height=12),
             msg_global,
-        ], scroll=ft.ScrollMode.AUTO, spacing=6, width=560),
+        ], scroll=ft.ScrollMode.AUTO, spacing=10, width=540),
         content_padding=ft.padding.symmetric(horizontal=20, vertical=16),
         bgcolor=FONDO_CARD,
         actions=[
@@ -694,12 +556,9 @@ def modal_editar_producto(page, db, id_producto, tipos, es_admin, on_guardado):
 
 
 def modal_desactivar(page, db, id_producto, nombre_producto, on_guardado):
-    """Modal de confirmación para desactivar un producto."""
-
     def confirmar(e):
         result = db.run_query(
-            "UPDATE producto SET activo = 0 WHERE idProducto = %s",
-            (id_producto,)
+            "UPDATE producto SET activo = 0 WHERE idProducto = %s", (id_producto,)
         )
         if result['success']:
             page.close(dlg)
@@ -715,8 +574,8 @@ def modal_desactivar(page, db, id_producto, nombre_producto, on_guardado):
             ft.Text(f'¿Desactivar "{nombre_producto}"?', size=14, color=TEXTO),
             ft.Container(height=4),
             ft.Text(
-                "El producto no aparecerá en el inventario ni en ventas, "
-                "pero su historial de movimientos y facturas se conserva intacto.",
+                "El producto desaparecerá del inventario y no podrá usarse en ventas, "
+                "pero su historial de movimientos y facturas queda intacto.",
                 size=12, color=TEXTO_GRIS,
             ),
         ], spacing=6, width=400),
@@ -739,24 +598,15 @@ def modal_desactivar(page, db, id_producto, nombre_producto, on_guardado):
 
 
 def modal_entrada(page, db, ubicaciones, on_guardado):
-    """Modal para registrar entrada de mercancía a una ubicación."""
+    resultados_busqueda  = ft.Column(spacing=4)
+    producto_seleccionado = {"id": None, "nombre": None, "unidad": None}
 
-    # Buscar producto
-    resultados_busqueda = ft.Column(spacing=4)
-    producto_seleccionado = {"id": None, "nombre": None, "presentaciones": []}
-    pres_seleccionada     = {"id": None, "factor": 1.0}
+    f_buscar   = campo("Buscar producto *", "Escribe el nombre...")
+    msg_buscar = ft.Text("", size=12, color=TEXTO_GRIS)
+    label_prod = ft.Text("", size=13, color=VERDE_CLARO, weight=ft.FontWeight.W_600)
+    label_unidad = ft.Text("", size=12, color=TEXTO_GRIS, italic=True)
 
-    f_buscar    = campo("Buscar producto *", "Escribe el nombre...")
-    msg_buscar  = ft.Text("", size=12, color=TEXTO_GRIS)
-    dd_pres     = ft.Dropdown(
-        label="Presentación",
-        border_radius=8, bgcolor="#1a1f25",
-        border_color=BORDE, focused_border_color=VERDE,
-        text_size=13, visible=False,
-        label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
-        expand=True,
-    )
-    dd_ubic     = ft.Dropdown(
+    dd_ubic = ft.Dropdown(
         label="Ubicación destino *",
         border_radius=8, bgcolor="#1a1f25",
         border_color=BORDE, focused_border_color=VERDE,
@@ -766,10 +616,9 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
                  for u in ubicaciones],
         expand=True,
     )
-    f_cantidad  = campo("Cantidad *", "0", teclado=ft.KeyboardType.NUMBER)
-    f_obs       = campo("Observación (opcional)", "")
-    msg_global  = ft.Text("", size=13, color=ROJO)
-    label_prod  = ft.Text("", size=13, color=VERDE_CLARO, weight=ft.FontWeight.W_600)
+    f_cantidad = campo("Cantidad que ingresa *", "0", teclado=ft.KeyboardType.NUMBER)
+    f_obs      = campo("Observación (opcional)", "Ej: Pedido proveedor X")
+    msg_global = ft.Text("", size=13, color=ROJO)
 
     def buscar_producto(e):
         texto = f_buscar.value.strip()
@@ -780,15 +629,19 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             return
         msg_buscar.value = ""
         prods = db.fetch_query(
-            "SELECT idProducto, nombre FROM producto WHERE nombre LIKE %s AND activo=1 LIMIT 6",
+            """SELECT idProducto, nombre, unidad_medida_base
+               FROM producto WHERE nombre LIKE %s AND activo=1 LIMIT 6""",
             (f"%{texto}%",)
         )
         if not prods:
-            msg_buscar.value = "Sin resultados"
+            msg_buscar.value = "No se encontraron productos"
         for p in prods:
             resultados_busqueda.controls.append(
                 ft.Container(
-                    content=ft.Text(p['nombre'], size=13, color=TEXTO),
+                    content=ft.Row([
+                        ft.Text(p['nombre'], size=13, color=TEXTO, expand=True),
+                        ft.Text(p['unidad_medida_base'], size=12, color=TEXTO_GRIS),
+                    ]),
                     bgcolor="#1a1f25", border=ft.border.all(1, BORDE),
                     border_radius=6,
                     padding=ft.padding.symmetric(horizontal=12, vertical=8),
@@ -801,41 +654,20 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
     def seleccionar_producto(prod):
         producto_seleccionado['id']     = prod['idProducto']
         producto_seleccionado['nombre'] = prod['nombre']
-        label_prod.value = f"✔ {prod['nombre']}"
-        f_buscar.value   = prod['nombre']
+        producto_seleccionado['unidad'] = prod['unidad_medida_base']
+        f_buscar.value = prod['nombre']
+        label_prod.value   = f"✔  {prod['nombre']}"
+        label_unidad.value = f"Unidad: {prod['unidad_medida_base']}"
+        f_cantidad.label   = f"Cantidad ({prod['unidad_medida_base']}) *"
         resultados_busqueda.controls.clear()
-
-        pres = db.fetch_query(
-            "SELECT idPresentacion, nombre_presentacion, factor_conversion "
-            "FROM producto_presentacion WHERE idProducto=%s ORDER BY es_unidad_base DESC",
-            (prod['idProducto'],)
-        )
-        producto_seleccionado['presentaciones'] = pres
-        dd_pres.options = [
-            ft.dropdown.Option(key=p['idPresentacion'],
-                               text=f"{p['nombre_presentacion']} (×{float(p['factor_conversion'])})")
-            for p in pres
-        ]
-        dd_pres.value   = pres[0]['idPresentacion'] if pres else None
-        dd_pres.visible = True
-        if pres:
-            pres_seleccionada['id']     = pres[0]['idPresentacion']
-            pres_seleccionada['factor'] = float(pres[0]['factor_conversion'])
+        msg_buscar.value = ""
         page.update()
 
-    def on_pres_change(e):
-        for p in producto_seleccionado['presentaciones']:
-            if p['idPresentacion'] == e.control.value:
-                pres_seleccionada['id']     = p['idPresentacion']
-                pres_seleccionada['factor'] = float(p['factor_conversion'])
-                break
-
-    dd_pres.on_change = on_pres_change
     f_buscar.on_change = buscar_producto
 
     def guardar(e):
         if not producto_seleccionado['id']:
-            msg_global.value = "Selecciona un producto"
+            msg_global.value = "Selecciona un producto de la búsqueda"
             page.update()
             return
         if not dd_ubic.value:
@@ -853,33 +685,28 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             page.update()
             return
 
-        cantidad_base = cantidad * pres_seleccionada['factor']
-        id_mov        = str(uuid.uuid4())
-        id_det        = str(uuid.uuid4())
+        id_mov = str(uuid.uuid4())
+        id_det = str(uuid.uuid4())
+        obs    = f_obs.value.strip() or "Entrada de mercancía"
 
         ops = [
-            # Cabecera del movimiento
             ("""INSERT INTO movimiento
                 (idMovimiento, tipo, fecha, idUbicacionDestino, idUsuario, observacion, sincronizado)
                 VALUES (%s,'ENTRADA',NOW(),%s,
                 (SELECT idUsuario FROM usuario WHERE estado=1 LIMIT 1),
                 %s, 0)""",
-             (id_mov, dd_ubic.value, f_obs.value.strip() or "Entrada de mercancía")),
+             (id_mov, dd_ubic.value, obs)),
 
-            # Detalle
             ("""INSERT INTO movimiento_detalle
-                (idDetalle, idMovimiento, idProducto, idPresentacion,
-                 cantidad, cantidad_base, precio_unitario_aplicado)
-                VALUES (%s,%s,%s,%s,%s,%s,0)""",
-             (id_det, id_mov, producto_seleccionado['id'],
-              pres_seleccionada['id'], cantidad, cantidad_base)),
+                (idDetalle, idMovimiento, idProducto, cantidad, cantidad_base, precio_unitario_aplicado)
+                VALUES (%s,%s,%s,%s,%s,0)""",
+             (id_det, id_mov, producto_seleccionado['id'], cantidad, cantidad)),
 
-            # Actualizar inventario
             ("""INSERT INTO inventario (idInventario, idUbicacion, idProducto, stockActual)
                 VALUES (%s,%s,%s,%s)
                 ON DUPLICATE KEY UPDATE stockActual = stockActual + %s""",
-             (str(uuid.uuid4()), dd_ubic.value, producto_seleccionado['id'],
-              cantidad_base, cantidad_base)),
+             (str(uuid.uuid4()), dd_ubic.value,
+              producto_seleccionado['id'], cantidad, cantidad)),
         ]
 
         result = db.run_transaction(ops)
@@ -887,7 +714,7 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             page.close(dlg)
             on_guardado()
         else:
-            msg_global.value = f"Error: {result['error']}"
+            msg_global.value = f"Error: {result.get('error', 'Error desconocido')}"
             page.update()
 
     dlg = ft.AlertDialog(
@@ -903,13 +730,13 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             msg_buscar,
             resultados_busqueda,
             label_prod,
-            dd_pres,
+            label_unidad,
             seccion_titulo("Cantidad y Destino"),
             ft.Row([f_cantidad, dd_ubic], spacing=10),
             f_obs,
             ft.Container(height=8),
             msg_global,
-        ], scroll=ft.ScrollMode.AUTO, spacing=6, width=520),
+        ], scroll=ft.ScrollMode.AUTO, spacing=6, width=500),
         content_padding=ft.padding.symmetric(horizontal=20, vertical=16),
         bgcolor=FONDO_CARD,
         actions=[
@@ -918,7 +745,7 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             ft.Container(
                 content=ft.Text("Registrar Entrada", size=13, color="white",
                                 weight=ft.FontWeight.W_600),
-                bgcolor=VERDE_CLARO, border_radius=8,
+                bgcolor="#1565c0", border_radius=8,
                 padding=ft.padding.symmetric(horizontal=20, vertical=10),
                 on_click=guardar, ink=True,
             ),
@@ -926,60 +753,6 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
         actions_alignment=ft.MainAxisAlignment.END,
     )
     return dlg
-
-
-# ─────────────────────────────────────────────────────────────
-# FILA DE PRODUCTO CON ACCIONES
-# ─────────────────────────────────────────────────────────────
-
-def fila_producto(producto, ubicaciones, indice, es_admin, on_editar, on_desactivar):
-    bg = FONDO_FILA if indice % 2 == 0 else FONDO_FILA_ALT
-    stock_total = sum(float(v) for v in producto['stocks'].values())
-
-    celdas = [
-        celda(ft.Text(producto['nombre'], size=13, color=TEXTO,
-                      weight=ft.FontWeight.W_500), ancho=200),
-        celda(badge_tipo(producto['tipo']), ancho=120),
-    ]
-    for ub in ubicaciones:
-        stock = producto['stocks'].get(ub['idUbicacion'], 0)
-        celdas.append(celda(indicador_stock(stock, producto['stock_minimo']), ancho=140))
-
-    celdas += [
-        celda(ft.Text(f"{stock_total:,.1f}", size=13, color=TEXTO_GRIS), ancho=100),
-        celda(ft.Text(producto['unidad'],     size=13, color=TEXTO_GRIS), ancho=90),
-        celda(ft.Text(f"${float(producto['precio_lista']):,.0f}",
-                      size=13, color=VERDE_CLARO), ancho=110),
-    ]
-    if es_admin:
-        pc = float(producto.get('precio_compra') or 0)
-        celdas.append(celda(ft.Text(f"${pc:,.0f}", size=13, color="#ef9a9a"), ancho=120))
-
-    # Acciones inline
-    celdas.append(celda(
-        ft.Row([
-            ft.IconButton(
-                icon="edit_rounded", icon_color=AMARILLO,
-                icon_size=18, tooltip="Editar",
-                on_click=lambda e, pid=producto['id'], pnom=producto['nombre']:
-                    on_editar(pid, pnom),
-            ),
-            ft.IconButton(
-                icon="visibility_off_rounded", icon_color=ROJO,
-                icon_size=18, tooltip="Desactivar",
-                on_click=lambda e, pid=producto['id'], pnom=producto['nombre']:
-                    on_desactivar(pid, pnom),
-            ),
-        ], spacing=0),
-        ancho=100
-    ))
-
-    return ft.Container(
-        content=ft.Row(celdas, spacing=0),
-        bgcolor=bg,
-        border=ft.border.only(bottom=ft.border.BorderSide(1, BORDE)),
-        on_hover=lambda e: _hover(e, bg),
-    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -991,6 +764,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
     es_admin    = (nombre_rol == ROL_ADMIN)
     ubicaciones = obtener_ubicaciones(db)
     tipos       = obtener_tipos(db)
+    unidades    = obtener_unidades(db)
 
     estado = {"tipo": None, "texto": None, "alerta": None}
 
@@ -1001,8 +775,6 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
     tabla_scroll   = ft.Row(controls=[cuerpo_tabla], scroll=ft.ScrollMode.AUTO, spacing=0)
     tabla_vertical = ft.Column(controls=[tabla_scroll], scroll=ft.ScrollMode.AUTO,
                                expand=True, spacing=0)
-
-    # ── Helpers ──
 
     def calcular_resumen(prods):
         total    = len(prods)
@@ -1032,9 +804,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         page.update()
 
     def reconstruir_resumen(prods):
-        filas_base = obtener_stock(db, estado["tipo"], estado["texto"], es_admin)
-        base       = agrupar_por_producto(filas_base, es_admin)
-        total, criticos, sin_stk = calcular_resumen(base)
+        total, criticos, sin_stk = calcular_resumen(prods)
 
         def click_critico(e):
             estado["alerta"] = None if estado["alerta"] == "critico" else "critico"
@@ -1112,10 +882,8 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         btn_refrescar.icon_color = VERDE_CLARO
         page.update()
 
-    # ── Acciones de filas ──
-
-    def abrir_editar(id_producto, nombre_producto):
-        dlg = modal_editar_producto(page, db, id_producto, tipos, es_admin,
+    def abrir_editar(id_producto):
+        dlg = modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin,
                                     on_guardado=refrescar_todo)
         if dlg:
             page.open(dlg)
@@ -1126,15 +894,13 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         page.open(dlg)
 
     def abrir_agregar(e):
-        dlg = modal_agregar_producto(page, db, tipos, ubicaciones, es_admin,
+        dlg = modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin,
                                      on_guardado=refrescar_todo)
         page.open(dlg)
 
     def abrir_entrada(e):
         dlg = modal_entrada(page, db, ubicaciones, on_guardado=refrescar_todo)
         page.open(dlg)
-
-    # ── Componentes ──
 
     buscador = ft.TextField(
         hint_text="Buscar producto por nombre...",
@@ -1173,7 +939,6 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
 
     reconstruir_filtros()
 
-    # ── Layout ──
     contenido = ft.Column([
 
         ft.Row([
@@ -1211,7 +976,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
 
     ], expand=True, spacing=0)
 
-    # ── Carga inicial ──
+    # Carga inicial
     filas_ini = obtener_stock(db, None, None, es_admin)
     prods_ini = agrupar_por_producto(filas_ini, es_admin)
     reconstruir_resumen(prods_ini)
