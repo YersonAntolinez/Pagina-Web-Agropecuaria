@@ -21,6 +21,40 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from database.db_manager import DBManager
 
 # ─────────────────────────────────────────────────────────────
+# UTILIDADES DE FORMATO
+# ─────────────────────────────────────────────────────────────
+
+def leer_num(valor_str):
+    """Lee un número desde un campo formateado en colombiano. Ej: '100.000' -> 100000.0"""
+    try:
+        limpio = str(valor_str).strip().replace(".", "").replace(",", ".")
+        return float(limpio) if limpio else 0.0
+    except ValueError:
+        return 0.0
+
+def fmt_num(valor, decimales=1):
+    """Formatea un número con separador de miles colombiano (punto)."""
+    try:
+        v = float(valor)
+        if decimales == 0:
+            return f"{v:,.0f}".replace(",", ".")
+        else:
+            # Formatear con decimales, luego convertir separadores
+            s = f"{v:,.{decimales}f}"          # "1,234.5"
+            partes = s.split(".")
+            entero = partes[0].replace(",", ".")
+            return f"{entero},{partes[1]}" if len(partes) > 1 else entero
+    except (ValueError, TypeError):
+        return str(valor)
+
+def fmt_precio(valor):
+    """Formatea un precio como $100.000"""
+    try:
+        return f"${float(valor):,.0f}".replace(",", ".")
+    except (ValueError, TypeError):
+        return "$0"
+
+# ─────────────────────────────────────────────────────────────
 # COLORES
 # ─────────────────────────────────────────────────────────────
 VERDE          = "#1e7e34"
@@ -58,7 +92,7 @@ def obtener_unidades(db):
     )
 
 def obtener_stock(db, filtro_tipo=None, filtro_texto=None, es_admin=False):
-    campos_extra = ", p.precio_compra" if es_admin else ""
+    campos_extra = ", p.costo_promedio" if es_admin else ""
     query = f"""
         SELECT
             p.idProducto,
@@ -66,7 +100,8 @@ def obtener_stock(db, filtro_tipo=None, filtro_texto=None, es_admin=False):
             tp.nombre            AS tipo,
             p.unidad_medida_base AS unidad,
             p.stock_minimo,
-            p.precio_lista
+            p.precio_lista,
+            p.precio_compra
             {campos_extra},
             u.idUbicacion,
             u.nombreUbicacion,
@@ -111,8 +146,9 @@ def agrupar_por_producto(filas, es_admin=False):
                 'precio_lista': fila['precio_lista'],
                 'stocks':       {},
             }
+            entrada['precio_compra'] = fila.get('precio_compra', 0) or 0
             if es_admin:
-                entrada['precio_compra'] = fila.get('precio_compra', 0) or 0
+                entrada['costo_promedio'] = fila.get('costo_promedio', 0) or 0
             productos[pid] = entrada
         productos[pid]['stocks'][fila['idUbicacion']] = fila['stock']
     return list(productos.values())
@@ -123,25 +159,53 @@ def agrupar_por_producto(filas, es_admin=False):
 # ─────────────────────────────────────────────────────────────
 
 def campo(label, hint="", valor="", teclado=ft.KeyboardType.TEXT, expand=True, ancho=None):
+    """Retorna siempre un ft.TextField. Para campos numéricos, muestra preview formateado
+    en un atributo .preview (ft.Text) que el caller puede agregar al layout si quiere."""
+
+    def on_change(e):
+        if teclado != ft.KeyboardType.NUMBER:
+            return
+        raw = e.control.value.strip()
+        if not raw:
+            e.control.preview.value = ""
+        else:
+            try:
+                num = int(raw)
+                e.control.preview.value = f"{num:,}".replace(",", ".")
+            except ValueError:
+                e.control.preview.value = ""
+        e.control.preview.update()
+
     def on_focus(e):
-        # Al enfocar un campo numérico con valor 0, lo limpia para no tener que borrar
-        if teclado == ft.KeyboardType.NUMBER and e.control.value in ("0", "0.0"):
+        if teclado != ft.KeyboardType.NUMBER:
+            return
+        if e.control.value in ("0", ""):
             e.control.value = ""
             e.control.update()
 
+    val_inicial = "" if str(valor) in ("0", "0.0", "") and teclado == ft.KeyboardType.NUMBER else str(valor)
+
     tf = ft.TextField(
-        label=label, hint_text=hint, value=str(valor),
+        label=label, hint_text=hint, value=val_inicial,
         keyboard_type=teclado,
         border_radius=8, bgcolor="#1a1f25",
         border_color=BORDE, focused_border_color=VERDE,
         text_size=14, cursor_color=VERDE,
         label_style=ft.TextStyle(color=TEXTO_GRIS, size=13),
+        on_change=on_change,
         on_focus=on_focus,
         expand=expand,
     )
     if ancho:
         tf.width = ancho
+
+    # Adjuntar preview al TextField para acceso fácil
+    tf.preview = ft.Text("", size=11, color=TEXTO_GRIS, italic=True)
     return tf
+
+def campo_con_preview(f):
+    """Envuelve un campo numérico con su preview alineado debajo."""
+    return ft.Column([f, f.preview], spacing=2, expand=f.expand)
 
 def dropdown_tipos(tipos, valor_inicial=None):
     return ft.Dropdown(
@@ -195,13 +259,13 @@ def indicador_stock(stock_actual, stock_minimo):
     if s <= 0:
         color, icono, tip = ROJO,        "error_rounded",        "Sin stock"
     elif s <= m:
-        color, icono, tip = AMARILLO,    "warning_rounded",      f"Crítico (mínimo: {m:,.1f})"
+        color, icono, tip = AMARILLO,    "warning_rounded",      f"Crítico (mínimo: {fmt_num(m, 1)})"
     else:
         color, icono, tip = VERDE_STOCK, "check_circle_rounded", "Stock normal"
     return ft.Container(
         content=ft.Row([
             ft.Icon(icono, color=color, size=16),
-            ft.Text(f"{s:,.1f}", size=13, color=color, weight=ft.FontWeight.W_600),
+            ft.Text(fmt_num(s, 1), size=13, color=color, weight=ft.FontWeight.W_600),
         ], spacing=4),
         tooltip=tip,
     )
@@ -265,9 +329,7 @@ def encabezado_tabla(ubicaciones, es_admin=False):
     cols = [("Producto", 200), ("Categoría", 120)]
     for ub in ubicaciones:
         cols.append((ub['nombreUbicacion'], 140))
-    cols += [("Stock Total", 100), ("Unidad", 90), ("Precio Venta", 110)]
-    if es_admin:
-        cols.append(("Precio Compra", 120))
+    cols += [("Stock Total", 100), ("Unidad", 90), ("Precio Venta", 110), ("Precio Compra", 120)]
     cols.append(("Acciones", 100))
     return ft.Container(
         content=ft.Row([
@@ -298,14 +360,13 @@ def fila_producto(producto, ubicaciones, indice, es_admin, on_editar, on_desacti
         celdas.append(celda(indicador_stock(stock, producto['stock_minimo']), ancho=140))
 
     celdas += [
-        celda(ft.Text(f"{stock_total:,.1f}", size=13, color=TEXTO_GRIS), ancho=100),
+        celda(ft.Text(fmt_num(stock_total, 1), size=13, color=TEXTO_GRIS), ancho=100),
         celda(ft.Text(producto['unidad'],     size=13, color=TEXTO_GRIS), ancho=90),
-        celda(ft.Text(f"${float(producto['precio_lista']):,.0f}",
+        celda(ft.Text(fmt_precio(producto['precio_lista']),
                       size=13, color=VERDE_CLARO), ancho=110),
     ]
-    if es_admin:
-        pc = float(producto.get('precio_compra') or 0)
-        celdas.append(celda(ft.Text(f"${pc:,.0f}", size=13, color="#ef9a9a"), ancho=120))
+    pc = float(producto.get('precio_compra') or 0)
+    celdas.append(celda(ft.Text(fmt_precio(pc), size=13, color="#ef9a9a"), ancho=120))
 
     celdas.append(celda(
         ft.Row([
@@ -352,7 +413,7 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_
         f = campo(f"Stock inicial — {ub['nombreUbicacion']}",
                   "0", teclado=ft.KeyboardType.NUMBER, valor="0")
         stocks_fields[ub['idUbicacion']] = f
-        stock_rows.controls.append(f)
+        stock_rows.controls.append(campo_con_preview(f))
 
     def guardar(e):
         nombre = f_nombre.value.strip()
@@ -369,8 +430,8 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_
             page.update()
             return
         try:
-            precio_v = float(f_precio_v.value or 0)
-            precio_c = float(f_precio_c.value or 0) if f_precio_c else 0
+            precio_v = leer_num(f_precio_v.value)
+            precio_c = leer_num(f_precio_c.value) if f_precio_c else 0
             stk_min  = float(f_stock_min.value or 5)
         except ValueError:
             msg_global.value = "Precios y stock mínimo deben ser números"
@@ -384,10 +445,10 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_
             ops.append((
                 """INSERT INTO producto
                    (idProducto, nombre, idTipoProducto, unidad_medida_base,
-                    precio_lista, precio_compra, stock_minimo, activo, sincronizado)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,1,0)""",
+                    precio_lista, precio_compra, costo_promedio, stock_minimo, activo, sincronizado)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,0)""",
                 (id_producto, nombre, dd_tipo.value, dd_unidad.value,
-                 precio_v, precio_c, stk_min)
+                 precio_v, precio_c, precio_c, stk_min)
             ))
         else:
             ops.append((
@@ -400,7 +461,7 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_
 
         for uid_ubic, f_stk in stocks_fields.items():
             try:
-                stk_val = float(f_stk.value or 0)
+                stk_val = leer_num(f_stk.value)
             except ValueError:
                 stk_val = 0
             ops.append((
@@ -434,7 +495,7 @@ def modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin, on_
             ft.Container(height=4),
             ft.Row([dd_tipo, dd_unidad], spacing=12),
             ft.Container(height=4),
-            ft.Row(campos_precio + [f_stock_min], spacing=12),
+            ft.Row([campo_con_preview(c) for c in campos_precio] + [campo_con_preview(f_stock_min)], spacing=12),
 
             seccion_titulo("Stock Inicial por Ubicación"),
             ft.Text(
@@ -489,8 +550,8 @@ def modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin, on_g
             page.update()
             return
         try:
-            precio_v = float(f_precio_v.value or 0)
-            precio_c = float(f_precio_c.value or 0) if f_precio_c else None
+            precio_v = leer_num(f_precio_v.value)
+            precio_c = leer_num(f_precio_c.value) if f_precio_c else None
             stk_min  = float(f_stock_min.value or 5)
         except ValueError:
             msg_global.value = "Precios y stock mínimo deben ser números"
@@ -500,8 +561,8 @@ def modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin, on_g
         if es_admin and precio_c is not None:
             result = db.run_query(
                 """UPDATE producto SET nombre=%s, idTipoProducto=%s, unidad_medida_base=%s,
-                   precio_lista=%s, precio_compra=%s, stock_minimo=%s WHERE idProducto=%s""",
-                (nombre, dd_tipo.value, dd_unidad.value, precio_v, precio_c, stk_min, id_producto)
+                   precio_lista=%s, precio_compra=%s, costo_promedio=%s, stock_minimo=%s WHERE idProducto=%s""",
+                (nombre, dd_tipo.value, dd_unidad.value, precio_v, precio_c, precio_c, stk_min, id_producto)
             )
         else:
             result = db.run_query(
@@ -533,7 +594,7 @@ def modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin, on_g
             ft.Container(height=4),
             ft.Row([dd_tipo, dd_unidad], spacing=12),
             ft.Container(height=4),
-            ft.Row(campos_precio + [f_stock_min], spacing=12),
+            ft.Row([campo_con_preview(c) for c in campos_precio] + [campo_con_preview(f_stock_min)], spacing=12),
             ft.Container(height=12),
             msg_global,
         ], scroll=ft.ScrollMode.AUTO, spacing=10, width=540),
@@ -598,27 +659,88 @@ def modal_desactivar(page, db, id_producto, nombre_producto, on_guardado):
 
 
 def modal_entrada(page, db, ubicaciones, on_guardado):
-    resultados_busqueda  = ft.Column(spacing=4)
-    producto_seleccionado = {"id": None, "nombre": None, "unidad": None}
+    resultados_busqueda   = ft.Column(spacing=4)
+    producto_seleccionado = {"id": None, "nombre": None, "unidad": None,
+                             "precio_compra": 0, "precio_lista": 0, "stock_total": 0}
 
-    f_buscar   = campo("Buscar producto *", "Escribe el nombre...")
-    msg_buscar = ft.Text("", size=12, color=TEXTO_GRIS)
-    label_prod = ft.Text("", size=13, color=VERDE_CLARO, weight=ft.FontWeight.W_600)
+    f_buscar     = campo("Buscar producto *", "Escribe el nombre...")
+    msg_buscar   = ft.Text("", size=12, color=TEXTO_GRIS)
+    label_prod   = ft.Text("", size=13, color=VERDE_CLARO, weight=ft.FontWeight.W_600)
     label_unidad = ft.Text("", size=12, color=TEXTO_GRIS, italic=True)
 
-    dd_ubic = ft.Dropdown(
-        label="Ubicación destino *",
-        border_radius=8, bgcolor="#1a1f25",
-        border_color=BORDE, focused_border_color=VERDE,
-        text_size=13,
-        label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
-        options=[ft.dropdown.Option(key=u['idUbicacion'], text=u['nombreUbicacion'])
-                 for u in ubicaciones],
-        expand=True,
+    f_precio_c   = campo("Precio de compra por unidad *", "0", teclado=ft.KeyboardType.NUMBER)
+    f_obs        = campo("Observación (opcional)", "Ej: Pedido proveedor Agroquímicos S.A.")
+    msg_global   = ft.Text("", size=13, color=ROJO)
+    info_costo   = ft.Text("", size=12, color=TEXTO_GRIS, italic=True)
+
+    # Panel de actualización de precio de venta
+    panel_precio_venta = ft.Container(visible=False)
+    f_precio_v_nuevo   = campo("Nuevo precio de venta", "0", teclado=ft.KeyboardType.NUMBER)
+    cb_actualizar_pv   = ft.Checkbox(
+        label="Actualizar precio de venta del producto",
+        value=False, active_color=VERDE, check_color="white",
     )
-    f_cantidad = campo("Cantidad que ingresa *", "0", teclado=ft.KeyboardType.NUMBER)
-    f_obs      = campo("Observación (opcional)", "Ej: Pedido proveedor X")
-    msg_global = ft.Text("", size=13, color=ROJO)
+
+    # Campos de cantidad por ubicación
+    stocks_fields = {}
+    stocks_col    = ft.Column(spacing=8)
+
+    def construir_campos_ubicaciones(unidad="unidad"):
+        stocks_col.controls.clear()
+        stocks_fields.clear()
+        for ub in ubicaciones:
+            f = campo(
+                f"{ub['nombreUbicacion']}",
+                f"0 {unidad}",
+                teclado=ft.KeyboardType.NUMBER,
+                valor="0",
+            )
+            f.on_change = actualizar_info_costo
+            stocks_fields[ub['idUbicacion']] = f
+            stocks_col.controls.append(f)
+            stocks_col.controls.append(f.preview)
+
+    def cantidad_total():
+        total = 0
+        for f in stocks_fields.values():
+            try:
+                total += float(f.value or 0)
+            except ValueError:
+                pass
+        return total
+
+    def actualizar_info_costo(e=None):
+        if not producto_seleccionado['id']:
+            return
+        try:
+            cant_nueva  = cantidad_total()
+            costo_nuevo = leer_num(f_precio_c.value)
+        except ValueError:
+            return
+
+        stock_actual   = producto_seleccionado['stock_total']
+        costo_actual   = producto_seleccionado['costo_promedio']
+        total_unidades = stock_actual + cant_nueva
+
+        if total_unidades > 0 and cant_nueva > 0:
+            costo_promedio = ((stock_actual * costo_actual) + (cant_nueva * costo_nuevo)) / total_unidades
+            info_costo.value = (
+                f"Total a recibir: {fmt_num(cant_nueva)}  ·  "
+                f"Stock actual: {fmt_num(stock_actual)}  ·  "
+                f"Costo actual: {fmt_precio(costo_actual)}  →  "
+                f"Nuevo costo promedio: {fmt_precio(costo_promedio)}"
+            )
+            costo_cambio = abs(costo_nuevo - costo_actual) > 0.01
+            panel_precio_venta.visible = costo_cambio
+            if costo_cambio:
+                margen = producto_seleccionado['precio_lista'] - costo_actual
+                f_precio_v_nuevo.value = str(int(costo_nuevo + margen)) if margen > 0 else str(int(producto_seleccionado['precio_lista']))
+        else:
+            info_costo.value = ""
+            panel_precio_venta.visible = False
+        page.update()
+
+    f_precio_c.on_change = actualizar_info_costo
 
     def buscar_producto(e):
         texto = f_buscar.value.strip()
@@ -629,7 +751,7 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             return
         msg_buscar.value = ""
         prods = db.fetch_query(
-            """SELECT idProducto, nombre, unidad_medida_base
+            """SELECT idProducto, nombre, unidad_medida_base, precio_compra, costo_promedio, precio_lista
                FROM producto WHERE nombre LIKE %s AND activo=1 LIMIT 6""",
             (f"%{texto}%",)
         )
@@ -652,62 +774,145 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
         page.update()
 
     def seleccionar_producto(prod):
-        producto_seleccionado['id']     = prod['idProducto']
-        producto_seleccionado['nombre'] = prod['nombre']
-        producto_seleccionado['unidad'] = prod['unidad_medida_base']
-        f_buscar.value = prod['nombre']
+        stock_row = db.fetch_one(
+            "SELECT COALESCE(SUM(stockActual),0) AS total FROM inventario WHERE idProducto=%s",
+            (prod['idProducto'],)
+        )
+        stock_total = float(stock_row['total']) if stock_row else 0
+
+        producto_seleccionado['id']           = prod['idProducto']
+        producto_seleccionado['nombre']        = prod['nombre']
+        producto_seleccionado['unidad']        = prod['unidad_medida_base']
+        producto_seleccionado['precio_compra'] = float(prod.get('precio_compra') or 0)
+        producto_seleccionado['costo_promedio']  = float(prod.get('costo_promedio') or 0)
+        producto_seleccionado['precio_lista']  = float(prod['precio_lista'] or 0)
+        producto_seleccionado['stock_total']   = stock_total
+
+        f_buscar.value     = prod['nombre']
         label_prod.value   = f"✔  {prod['nombre']}"
         label_unidad.value = f"Unidad: {prod['unidad_medida_base']}"
-        f_cantidad.label   = f"Cantidad ({prod['unidad_medida_base']}) *"
+        f_precio_c.value   = str(int(float(prod['precio_compra'] or 0)))
         resultados_busqueda.controls.clear()
-        msg_buscar.value = ""
+        msg_buscar.value   = ""
+        info_costo.value   = ""
+        panel_precio_venta.visible = False
+        construir_campos_ubicaciones(prod['unidad_medida_base'])
         page.update()
 
     f_buscar.on_change = buscar_producto
+
+    panel_precio_venta.content = ft.Container(
+        content=ft.Column([
+            ft.Row([
+                ft.Icon("info_outline_rounded", color=AMARILLO, size=16),
+                ft.Text("El precio de compra cambió respecto al anterior",
+                        size=12, color=AMARILLO),
+            ], spacing=6),
+            ft.Container(height=4),
+            cb_actualizar_pv,
+            f_precio_v_nuevo,
+        ], spacing=6),
+        bgcolor="#1a1a0a",
+        border=ft.border.all(1, AMARILLO),
+        border_radius=8,
+        padding=12,
+    )
+
+    # Construir campos de ubicación vacíos al iniciar
+    construir_campos_ubicaciones()
 
     def guardar(e):
         if not producto_seleccionado['id']:
             msg_global.value = "Selecciona un producto de la búsqueda"
             page.update()
             return
-        if not dd_ubic.value:
-            msg_global.value = "Selecciona la ubicación destino"
-            page.update()
-            return
         try:
-            cantidad = float(f_cantidad.value or 0)
+            precio_c = leer_num(f_precio_c.value)
         except ValueError:
-            msg_global.value = "La cantidad debe ser un número"
+            msg_global.value = "El precio de compra debe ser un número"
             page.update()
             return
-        if cantidad <= 0:
-            msg_global.value = "La cantidad debe ser mayor a 0"
+        if precio_c < 0:
+            msg_global.value = "El precio de compra no puede ser negativo"
             page.update()
             return
 
-        id_mov = str(uuid.uuid4())
-        id_det = str(uuid.uuid4())
-        obs    = f_obs.value.strip() or "Entrada de mercancía"
+        # Validar que al menos una ubicación tenga cantidad > 0
+        distribuciones = []
+        for uid, f in stocks_fields.items():
+            try:
+                cant = float(f.value or 0)
+            except ValueError:
+                cant = 0
+            if cant > 0:
+                distribuciones.append((uid, cant))
+
+        if not distribuciones:
+            msg_global.value = "Ingresa la cantidad en al menos una ubicación"
+            page.update()
+            return
+
+        cantidad_total_entrada = sum(c for _, c in distribuciones)
+
+        # Calcular costo promedio ponderado
+        stock_actual   = producto_seleccionado['stock_total']
+        costo_actual   = producto_seleccionado['costo_promedio']
+        total_unidades = stock_actual + cantidad_total_entrada
+        costo_promedio = (
+            ((stock_actual * costo_actual) + (cantidad_total_entrada * precio_c)) / total_unidades
+            if total_unidades > 0 else precio_c
+        )
+
+        pid      = producto_seleccionado['id']
+        obs      = f_obs.value.strip() or "Recepción de mercancía"
+        id_mov   = str(uuid.uuid4())
+
+        usuario = db.fetch_one("SELECT idUsuario FROM usuario WHERE estado=1 LIMIT 1")
+        if not usuario:
+            msg_global.value = "Error: no hay usuario activo en el sistema"
+            page.update()
+            return
+        id_usuario = usuario['idUsuario']
 
         ops = [
+            # Cabecera del movimiento (sin ubicación destino fija, va en los detalles)
             ("""INSERT INTO movimiento
-                (idMovimiento, tipo, fecha, idUbicacionDestino, idUsuario, observacion, sincronizado)
-                VALUES (%s,'ENTRADA',NOW(),%s,
-                (SELECT idUsuario FROM usuario WHERE estado=1 LIMIT 1),
-                %s, 0)""",
-             (id_mov, dd_ubic.value, obs)),
+                (idMovimiento, tipo, fecha, idUsuario, observacion, sincronizado)
+                VALUES (%s,'ENTRADA',NOW(),%s,%s,0)""",
+             (id_mov, id_usuario, obs)),
 
-            ("""INSERT INTO movimiento_detalle
-                (idDetalle, idMovimiento, idProducto, cantidad, cantidad_base, precio_unitario_aplicado)
-                VALUES (%s,%s,%s,%s,%s,0)""",
-             (id_det, id_mov, producto_seleccionado['id'], cantidad, cantidad)),
-
-            ("""INSERT INTO inventario (idInventario, idUbicacion, idProducto, stockActual)
-                VALUES (%s,%s,%s,%s)
-                ON DUPLICATE KEY UPDATE stockActual = stockActual + %s""",
-             (str(uuid.uuid4()), dd_ubic.value,
-              producto_seleccionado['id'], cantidad, cantidad)),
+            # Actualizar costo promedio y precio de compra reciente
+            ("UPDATE producto SET costo_promedio = %s, precio_compra = %s WHERE idProducto = %s",
+             (round(costo_promedio, 2), precio_c, pid)),
         ]
+
+        # Un detalle e inventario por cada ubicación con cantidad > 0
+        for uid, cant in distribuciones:
+            ops.append((
+                """INSERT INTO movimiento_detalle
+                   (idDetalle, idMovimiento, idProducto,
+                    cantidad, cantidad_base, precio_unitario_aplicado, precio_costo)
+                   VALUES (%s,%s,%s,%s,%s,0,%s)""",
+                (str(uuid.uuid4()), id_mov, pid, cant, cant, precio_c)
+            ))
+            ops.append((
+                """INSERT INTO inventario (idInventario, idUbicacion, idProducto, stockActual)
+                   VALUES (%s,%s,%s,%s)
+                   ON DUPLICATE KEY UPDATE stockActual = stockActual + %s""",
+                (str(uuid.uuid4()), uid, pid, cant, cant)
+            ))
+
+        # Actualizar precio de venta si se marcó
+        if cb_actualizar_pv.value and panel_precio_venta.visible:
+            try:
+                nuevo_pv = leer_num(f_precio_v_nuevo.value)
+                if nuevo_pv > 0:
+                    ops.append((
+                        "UPDATE producto SET precio_lista = %s WHERE idProducto = %s",
+                        (nuevo_pv, pid)
+                    ))
+            except ValueError:
+                pass
 
         result = db.run_transaction(ops)
         if result['success']:
@@ -721,7 +926,7 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
         modal=True,
         title=ft.Row([
             ft.Icon("move_to_inbox_rounded", color=VERDE_CLARO, size=22),
-            ft.Text("Registrar Entrada de Mercancía", size=18,
+            ft.Text("Recepción de Mercancía", size=18,
                     weight=ft.FontWeight.BOLD, color=TEXTO),
         ], spacing=10),
         content=ft.Column([
@@ -731,19 +936,31 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
             resultados_busqueda,
             label_prod,
             label_unidad,
-            seccion_titulo("Cantidad y Destino"),
-            ft.Row([f_cantidad, dd_ubic], spacing=10),
+            seccion_titulo("Precio de Compra"),
+            campo_con_preview(f_precio_c),
+            seccion_titulo("Distribución por Ubicación"),
+            ft.Text(
+                "Ingresa cuántas unidades van a cada ubicación. "
+                "Deja en 0 las que no reciben mercancía.",
+                size=13, color=TEXTO_GRIS,
+            ),
+            ft.Container(height=4),
+            stocks_col,
+            ft.Container(height=4),
+            info_costo,
+            panel_precio_venta,
+            seccion_titulo("Observación"),
             f_obs,
             ft.Container(height=8),
             msg_global,
-        ], scroll=ft.ScrollMode.AUTO, spacing=6, width=500),
+        ], scroll=ft.ScrollMode.AUTO, spacing=8, width=520),
         content_padding=ft.padding.symmetric(horizontal=20, vertical=16),
         bgcolor=FONDO_CARD,
         actions=[
             ft.TextButton("Cancelar", style=ft.ButtonStyle(color=TEXTO_GRIS),
                           on_click=lambda e: page.close(dlg)),
             ft.Container(
-                content=ft.Text("Registrar Entrada", size=13, color="white",
+                content=ft.Text("Confirmar Recepción", size=13, color="white",
                                 weight=ft.FontWeight.W_600),
                 bgcolor="#1565c0", border_radius=8,
                 padding=ft.padding.symmetric(horizontal=20, vertical=10),
@@ -930,7 +1147,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
     btn_entrada = ft.Container(
         content=ft.Row([
             ft.Icon("move_to_inbox_rounded", color="white", size=18),
-            ft.Text("Registrar Entrada", size=13, color="white", weight=ft.FontWeight.W_600),
+            ft.Text("Recepción de Mercancía", size=13, color="white", weight=ft.FontWeight.W_600),
         ], spacing=6),
         bgcolor="#1565c0", border_radius=8,
         padding=ft.padding.symmetric(horizontal=16, vertical=10),
