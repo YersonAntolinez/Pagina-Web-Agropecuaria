@@ -532,13 +532,21 @@ def modal_editar_producto(page, db, id_producto, tipos, unidades, es_admin, on_g
     if not prod:
         return None
 
+    def fmt_val(v):
+        """Convierte 32000.00 → '32.000' para mostrar en campo numérico."""
+        try:
+            n = float(v or 0)
+            return f"{int(n):,}".replace(",", ".") if n == int(n) else str(n)
+        except (ValueError, TypeError):
+            return "0"
+
     f_nombre    = campo("Nombre *", valor=prod['nombre'])
     f_precio_v  = campo("Precio de venta *", teclado=ft.KeyboardType.NUMBER,
-                        valor=prod['precio_lista'])
+                        valor=fmt_val(prod['precio_lista']))
     f_precio_c  = campo("Precio de compra", teclado=ft.KeyboardType.NUMBER,
-                        valor=prod.get('precio_compra', 0)) if es_admin else None
+                        valor=fmt_val(prod.get('precio_compra', 0))) if es_admin else None
     f_stock_min = campo("Stock mínimo *", teclado=ft.KeyboardType.NUMBER,
-                        valor=prod['stock_minimo'], expand=False, ancho=160)
+                        valor=fmt_val(prod['stock_minimo']), expand=False, ancho=160)
     dd_tipo     = dropdown_tipos(tipos, valor_inicial=prod['idTipoProducto'])
     dd_unidad   = dropdown_unidad(unidades, valor_inicial=prod['unidad_medida_base'])
     msg_global  = ft.Text("", size=13, color=ROJO)
@@ -972,6 +980,226 @@ def modal_entrada(page, db, ubicaciones, on_guardado):
     return dlg
 
 
+def modal_traslado(page, db, ubicaciones, on_guardado):
+    """Modal para trasladar productos entre ubicaciones."""
+    resultados_busqueda   = ft.Column(spacing=4)
+    producto_seleccionado = {"id": None, "nombre": None, "unidad": None, "stocks": {}}
+
+    f_buscar     = campo("Buscar producto *", "Escribe el nombre...")
+    msg_buscar   = ft.Text("", size=12, color=TEXTO_GRIS)
+    label_prod   = ft.Text("", size=13, color=VERDE_CLARO, weight=ft.FontWeight.W_600)
+    msg_global   = ft.Text("", size=13, color=ROJO)
+
+    # Stock disponible por ubicación origen
+    stock_disponible = ft.Column(spacing=4)
+
+    dd_origen = ft.Dropdown(
+        label="Ubicación origen *",
+        border_radius=8, bgcolor="#1a1f25",
+        border_color=BORDE, focused_border_color=VERDE,
+        text_size=13,
+        label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
+        options=[ft.dropdown.Option(key=u['idUbicacion'], text=u['nombreUbicacion'])
+                 for u in ubicaciones],
+        expand=True,
+    )
+    dd_destino = ft.Dropdown(
+        label="Ubicación destino *",
+        border_radius=8, bgcolor="#1a1f25",
+        border_color=BORDE, focused_border_color=VERDE,
+        text_size=13,
+        label_style=ft.TextStyle(color=TEXTO_GRIS, size=12),
+        options=[ft.dropdown.Option(key=u['idUbicacion'], text=u['nombreUbicacion'])
+                 for u in ubicaciones],
+        expand=True,
+    )
+    f_cantidad = campo("Cantidad a trasladar *", "0", teclado=ft.KeyboardType.NUMBER)
+    f_obs      = campo("Observación (opcional)", "Ej: Reabastecimiento punto de venta")
+
+    def actualizar_stock_disponible(e=None):
+        stock_disponible.controls.clear()
+        pid = producto_seleccionado['id']
+        if not pid or not dd_origen.value:
+            page.update()
+            return
+        stk = producto_seleccionado['stocks'].get(dd_origen.value, 0)
+        unidad = producto_seleccionado['unidad'] or ""
+        color = VERDE_STOCK if float(stk) > 0 else ROJO
+        stock_disponible.controls.append(
+            ft.Text(f"Disponible en origen: {fmt_num(stk)} {unidad}",
+                    size=12, color=color, italic=True)
+        )
+        page.update()
+
+    dd_origen.on_change = actualizar_stock_disponible
+
+    def buscar_producto(e):
+        texto = f_buscar.value.strip()
+        resultados_busqueda.controls.clear()
+        if len(texto) < 2:
+            msg_buscar.value = "Escribe al menos 2 caracteres"
+            page.update()
+            return
+        msg_buscar.value = ""
+        prods = db.fetch_query(
+            """SELECT idProducto, nombre, unidad_medida_base
+               FROM producto WHERE nombre LIKE %s AND activo=1 LIMIT 6""",
+            (f"%{texto}%",)
+        )
+        if not prods:
+            msg_buscar.value = "No se encontraron productos"
+        for p in prods:
+            resultados_busqueda.controls.append(
+                ft.Container(
+                    content=ft.Row([
+                        ft.Text(p['nombre'], size=13, color=TEXTO, expand=True),
+                        ft.Text(p['unidad_medida_base'], size=12, color=TEXTO_GRIS),
+                    ]),
+                    bgcolor="#1a1f25", border=ft.border.all(1, BORDE),
+                    border_radius=6,
+                    padding=ft.padding.symmetric(horizontal=12, vertical=8),
+                    on_click=lambda e, prod=p: seleccionar_producto(prod),
+                    ink=True,
+                )
+            )
+        page.update()
+
+    def seleccionar_producto(prod):
+        # Traer stock por ubicación
+        filas = db.fetch_query(
+            """SELECT i.idUbicacion, i.stockActual
+               FROM inventario i WHERE i.idProducto = %s""",
+            (prod['idProducto'],)
+        )
+        stocks = {f['idUbicacion']: float(f['stockActual']) for f in filas} if filas else {}
+
+        producto_seleccionado['id']     = prod['idProducto']
+        producto_seleccionado['nombre'] = prod['nombre']
+        producto_seleccionado['unidad'] = prod['unidad_medida_base']
+        producto_seleccionado['stocks'] = stocks
+
+        f_buscar.value   = prod['nombre']
+        label_prod.value = f"✔  {prod['nombre']}"
+        f_cantidad.label = f"Cantidad ({prod['unidad_medida_base']}) a trasladar *"
+        resultados_busqueda.controls.clear()
+        msg_buscar.value = ""
+        actualizar_stock_disponible()
+
+    f_buscar.on_change = buscar_producto
+
+    def guardar(e):
+        if not producto_seleccionado['id']:
+            msg_global.value = "Selecciona un producto"
+            page.update()
+            return
+        if not dd_origen.value or not dd_destino.value:
+            msg_global.value = "Selecciona origen y destino"
+            page.update()
+            return
+        if dd_origen.value == dd_destino.value:
+            msg_global.value = "El origen y el destino no pueden ser iguales"
+            page.update()
+            return
+        try:
+            cantidad = leer_num(f_cantidad.value)
+        except ValueError:
+            msg_global.value = "La cantidad debe ser un número"
+            page.update()
+            return
+        if cantidad <= 0:
+            msg_global.value = "La cantidad debe ser mayor a 0"
+            page.update()
+            return
+
+        stock_origen = producto_seleccionado['stocks'].get(dd_origen.value, 0)
+        if cantidad > stock_origen:
+            msg_global.value = f"Stock insuficiente en origen ({fmt_num(stock_origen)} disponibles)"
+            page.update()
+            return
+
+        pid    = producto_seleccionado['id']
+        id_mov = str(uuid.uuid4())
+        obs    = f_obs.value.strip() or "Traslado entre ubicaciones"
+
+        usuario = db.fetch_one("SELECT idUsuario FROM usuario WHERE estado=1 LIMIT 1")
+        if not usuario:
+            msg_global.value = "Error: no hay usuario activo"
+            page.update()
+            return
+
+        ops = [
+            ("""INSERT INTO movimiento
+                (idMovimiento, tipo, fecha, idUbicacionOrigen, idUbicacionDestino,
+                 idUsuario, observacion, sincronizado)
+                VALUES (%s,'TRASLADO',NOW(),%s,%s,%s,%s,0)""",
+             (id_mov, dd_origen.value, dd_destino.value, usuario['idUsuario'], obs)),
+
+            ("""INSERT INTO movimiento_detalle
+                (idDetalle, idMovimiento, idProducto, cantidad, cantidad_base,
+                 precio_unitario_aplicado, precio_costo)
+                VALUES (%s,%s,%s,%s,%s,0,0)""",
+             (str(uuid.uuid4()), id_mov, pid, cantidad, cantidad)),
+
+            # Restar en origen
+            ("""UPDATE inventario SET stockActual = stockActual - %s
+                WHERE idProducto = %s AND idUbicacion = %s""",
+             (cantidad, pid, dd_origen.value)),
+
+            # Sumar en destino
+            ("""INSERT INTO inventario (idInventario, idUbicacion, idProducto, stockActual)
+                VALUES (%s,%s,%s,%s)
+                ON DUPLICATE KEY UPDATE stockActual = stockActual + %s""",
+             (str(uuid.uuid4()), dd_destino.value, pid, cantidad, cantidad)),
+        ]
+
+        result = db.run_transaction(ops)
+        if result['success']:
+            page.close(dlg)
+            on_guardado()
+        else:
+            msg_global.value = f"Error: {result.get('error', 'Error desconocido')}"
+            page.update()
+
+    dlg = ft.AlertDialog(
+        modal=True,
+        title=ft.Row([
+            ft.Icon("swap_horiz_rounded", color="#7e57c2", size=22),
+            ft.Text("Traslado entre Ubicaciones", size=18,
+                    weight=ft.FontWeight.BOLD, color=TEXTO),
+        ], spacing=10),
+        content=ft.Column([
+            seccion_titulo("Producto"),
+            f_buscar,
+            msg_buscar,
+            resultados_busqueda,
+            label_prod,
+            seccion_titulo("Origen y Destino"),
+            ft.Row([dd_origen, dd_destino], spacing=12),
+            stock_disponible,
+            seccion_titulo("Cantidad"),
+            campo_con_preview(f_cantidad),
+            f_obs,
+            ft.Container(height=8),
+            msg_global,
+        ], scroll=ft.ScrollMode.AUTO, spacing=8, width=520),
+        content_padding=ft.padding.symmetric(horizontal=20, vertical=16),
+        bgcolor=FONDO_CARD,
+        actions=[
+            ft.TextButton("Cancelar", style=ft.ButtonStyle(color=TEXTO_GRIS),
+                          on_click=lambda e: page.close(dlg)),
+            ft.Container(
+                content=ft.Text("Confirmar Traslado", size=13, color="white",
+                                weight=ft.FontWeight.W_600),
+                bgcolor="#7e57c2", border_radius=8,
+                padding=ft.padding.symmetric(horizontal=20, vertical=10),
+                on_click=guardar, ink=True,
+            ),
+        ],
+        actions_alignment=ft.MainAxisAlignment.END,
+    )
+    return dlg
+
+
 # ─────────────────────────────────────────────────────────────
 # VISTA PRINCIPAL
 # ─────────────────────────────────────────────────────────────
@@ -1110,6 +1338,10 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
                                on_guardado=refrescar_todo)
         page.open(dlg)
 
+    def abrir_traslado(e):
+        dlg = modal_traslado(page, db, ubicaciones, on_guardado=refrescar_todo)
+        page.open(dlg)
+
     def abrir_agregar(e):
         dlg = modal_agregar_producto(page, db, tipos, ubicaciones, unidades, es_admin,
                                      on_guardado=refrescar_todo)
@@ -1144,6 +1376,16 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         visible=es_admin,
     )
 
+    btn_traslado = ft.Container(
+        content=ft.Row([
+            ft.Icon("swap_horiz_rounded", color="white", size=18),
+            ft.Text("Traslado entre Ubicaciones", size=13, color="white", weight=ft.FontWeight.W_600),
+        ], spacing=6),
+        bgcolor="#7e57c2", border_radius=8,
+        padding=ft.padding.symmetric(horizontal=16, vertical=10),
+        on_click=abrir_traslado, ink=True,
+    )
+
     btn_entrada = ft.Container(
         content=ft.Row([
             ft.Icon("move_to_inbox_rounded", color="white", size=18),
@@ -1164,7 +1406,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
                         weight=ft.FontWeight.BOLD, color=TEXTO),
                 ft.Text("Productos disponibles por ubicación", size=13, color=TEXTO_GRIS),
             ], spacing=2, expand=True),
-            ft.Row([btn_entrada, btn_agregar, btn_refrescar], spacing=8),
+            ft.Row([btn_traslado, btn_entrada, btn_agregar, btn_refrescar], spacing=8),
         ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
 
         ft.Container(height=14),
