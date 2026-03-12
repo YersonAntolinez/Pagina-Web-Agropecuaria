@@ -33,17 +33,16 @@ def leer_num(valor_str):
         return 0.0
 
 def fmt_num(valor, decimales=1):
-    """Formatea un número con separador de miles colombiano (punto)."""
+    """Formatea un número con separador de miles colombiano (punto).
+    Si el valor es entero, nunca muestra decimales: 20.0 → '20', 1.5 → '1,5'"""
     try:
         v = float(valor)
-        if decimales == 0:
-            return f"{v:,.0f}".replace(",", ".")
-        else:
-            # Formatear con decimales, luego convertir separadores
-            s = f"{v:,.{decimales}f}"          # "1,234.5"
-            partes = s.split(".")
-            entero = partes[0].replace(",", ".")
-            return f"{entero},{partes[1]}" if len(partes) > 1 else entero
+        if v == int(v):
+            return f"{int(v):,}".replace(",", ".")
+        s = f"{v:,.{decimales}f}"
+        partes = s.split(".")
+        entero = partes[0].replace(",", ".")
+        return f"{entero},{partes[1]}" if len(partes) > 1 else entero
     except (ValueError, TypeError):
         return str(valor)
 
@@ -326,11 +325,14 @@ def _hover(e, bg_original):
     e.control.update()
 
 def encabezado_tabla(ubicaciones, es_admin=False):
-    cols = [("Producto", 200), ("Categoría", 120)]
+    # Anchos fijos en px — deben coincidir exactamente con fila_producto
+    cols = [("Producto", 220), ("Categoría", 130)]
     for ub in ubicaciones:
-        cols.append((ub['nombreUbicacion'], 140))
-    cols += [("Stock Total", 100), ("Unidad", 90), ("Precio Venta", 110), ("Precio Compra", 120)]
-    cols.append(("Acciones", 100))
+        cols.append((ub['nombreUbicacion'], 130))
+    cols += [("Stock Total", 100), ("Unidad", 100), ("Precio Venta", 120)]
+    if es_admin:
+        cols.append(("Precio Compra", 120))
+    cols.append(("Acciones", 90))
     return ft.Container(
         content=ft.Row([
             ft.Container(
@@ -352,21 +354,22 @@ def fila_producto(producto, ubicaciones, indice, es_admin, on_editar, on_desacti
 
     celdas = [
         celda(ft.Text(producto['nombre'], size=13, color=TEXTO,
-                      weight=ft.FontWeight.W_500), ancho=200),
-        celda(badge_tipo(producto['tipo']), ancho=120),
+                      weight=ft.FontWeight.W_500), ancho=220),
+        celda(badge_tipo(producto['tipo']), ancho=130),
     ]
     for ub in ubicaciones:
         stock = producto['stocks'].get(ub['idUbicacion'], 0)
-        celdas.append(celda(indicador_stock(stock, producto['stock_minimo']), ancho=140))
+        celdas.append(celda(indicador_stock(stock, producto['stock_minimo']), ancho=130))
 
     celdas += [
         celda(ft.Text(fmt_num(stock_total, 1), size=13, color=TEXTO_GRIS), ancho=100),
-        celda(ft.Text(producto['unidad'],     size=13, color=TEXTO_GRIS), ancho=90),
+        celda(ft.Text(producto['unidad'],      size=13, color=TEXTO_GRIS), ancho=100),
         celda(ft.Text(fmt_precio(producto['precio_lista']),
-                      size=13, color=VERDE_CLARO), ancho=110),
+                      size=13, color=VERDE_CLARO), ancho=120),
     ]
-    pc = float(producto.get('precio_compra') or 0)
-    celdas.append(celda(ft.Text(fmt_precio(pc), size=13, color="#ef9a9a"), ancho=120))
+    if es_admin:
+        pc = float(producto.get('precio_compra') or 0)
+        celdas.append(celda(ft.Text(fmt_precio(pc), size=13, color="#ef9a9a"), ancho=120))
 
     celdas.append(celda(
         ft.Row([
@@ -382,8 +385,15 @@ def fila_producto(producto, ubicaciones, indice, es_admin, on_editar, on_desacti
                     on_desactivar(pid, pnom),
             ),
         ], spacing=0),
-        ancho=100
+        ancho=90,
     ))
+
+    return ft.Container(
+        content=ft.Row(celdas, spacing=0),
+        bgcolor=bg,
+        border=ft.border.only(bottom=ft.border.BorderSide(1, BORDE)),
+        on_hover=lambda e: _hover(e, bg),
+    )
 
     return ft.Container(
         content=ft.Row(celdas, spacing=0),
@@ -1215,16 +1225,15 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
 
     resumen_row  = ft.Row(spacing=12)
     filtros_row  = ft.Row(spacing=8, wrap=True)
-    cuerpo_tabla = ft.Column(spacing=0)
+    cuerpo_tabla = ft.Column(spacing=0, expand=True)
 
-    tabla_scroll   = ft.Row(controls=[cuerpo_tabla], scroll=ft.ScrollMode.AUTO, spacing=0)
-    tabla_vertical = ft.Column(controls=[tabla_scroll], scroll=ft.ScrollMode.AUTO,
-                               expand=True, spacing=0)
+    tabla_scroll   = ft.Row(controls=[cuerpo_tabla], scroll=ft.ScrollMode.AUTO, spacing=0, expand=True)
+    tabla_vertical = ft.Column(controls=[tabla_scroll], scroll=ft.ScrollMode.AUTO, expand=True, spacing=0)
 
     def calcular_resumen(prods):
         total    = len(prods)
         criticos = sum(1 for p in prods if any(
-            float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
+            0 < float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
         ))
         sin_stk  = sum(1 for p in prods if any(
             float(v) <= 0 for v in p['stocks'].values()
@@ -1236,7 +1245,7 @@ async def vista_inventario(page: ft.Page, db: DBManager, nombre_rol: str = ROL_A
         prods = agrupar_por_producto(filas, es_admin)
         if estado["alerta"] == "critico":
             prods_tabla = [p for p in prods if any(
-                float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
+                0 < float(v) <= float(p['stock_minimo']) for v in p['stocks'].values()
             )]
         elif estado["alerta"] == "sin_stock":
             prods_tabla = [p for p in prods if any(
